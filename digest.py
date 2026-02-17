@@ -1,0 +1,266 @@
+import feedparser
+import smtplib
+import os
+import html
+import json
+import tempfile
+import shutil
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+
+# -----------------------------
+# Configuration
+# -----------------------------
+
+EMAIL_TARGETS = [
+
+	email.strip()
+	for email in os.environ.get("digest_targets","").split(",")
+	if email.strip()
+
+]
+
+if not EMAIL_TARGETS:
+	EMAIL_TARGETS = ["fallback@email.com"]
+
+CISA_FEED = "https://www.cisa.gov/cybersecurity-advisories/all.xml"
+
+FEEDS = [
+	CISA_FEED,
+	"https://krebsonsecurity.com/feed/",
+	"https://feeds.feedburner.com/TheHackersNews",
+	"https://www.darkreading.com/rss.xml",
+	"https://techcrunch.com/feed/",
+	"https://www.schneier.com/blog/atom.xml",
+	"https://www.bleepingcomputer.com/feed/",
+	"https://www.wired.com/feed/category/security/latest/rss",
+	"https://www.wired.com/feed/tag/ai/latest/rss"
+]
+
+STATE_FILE = "sent_articles.json"
+
+CUTOFF_TIME = datetime.now(timezone.utc) - timedelta(hours=24)
+LOCAL_TZ = ZoneInfo("America/New_York")
+
+current_time_str = datetime.now(LOCAL_TZ).strftime("%b %d, %Y at %I:%M %p %Z")
+
+# -----------------------------
+# State Handling
+# -----------------------------
+
+def load_sent_articles():
+	if not os.path.exists(STATE_FILE):
+		return set()
+
+	if os.path.getsize(STATE_FILE) == 0:
+		return set()
+
+	try:
+		with open(STATE_FILE, "r", encoding="utf-8") as f:
+			data = json.load(f)
+		if isinstance(data, list):
+			return set(data)
+		elif isinstance(data, dict):
+			return set(data.keys())   # in case someone saved as dict
+		else:
+			print(f"Warning: {STATE_FILE} has unexpected type {type(data)}. Starting fresh.")
+			return set()
+	except json.JSONDecodeError as e:
+		print(f"Warning: {STATE_FILE} is invalid JSON ({e}). Starting with empty set.")
+		return set()
+	except Exception as e:
+		print(f"Unexpected error reading {STATE_FILE}: {e}. Starting fresh.")
+		return set()
+
+
+def save_sent_articles(sent_set):
+	# Write to temp file → atomic replace (safer on crash)
+	data = list(sent_set)  # sets aren't directly JSON serializable
+	tmp = None
+	try:
+		with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
+			json.dump(data, tmp, indent=None, ensure_ascii=False)
+			tmp_path = tmp.name
+
+		shutil.move(tmp_path, STATE_FILE)
+	except Exception as e:
+		print(f"Failed to save {STATE_FILE}: {e}")
+		if tmp_path and os.path.exists(tmp_path):
+			os.unlink(tmp_path)  # clean up temp file
+
+
+# -----------------------------
+# Helper Functions
+# -----------------------------
+
+def extract_datetime(entry):
+	if entry.get("published_parsed"):
+		return datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+
+	if entry.get("updated_parsed"):
+		return datetime(*entry.updated_parsed[:6], tzinfo=timezone.utc)
+
+	return None
+
+
+# -----------------------------
+# Main Logic
+# -----------------------------
+
+def main():
+	sent_articles = load_sent_articles()
+	new_articles = []
+	cisa_alerts = []
+
+	for url in FEEDS:
+		feed = feedparser.parse(url)
+
+		for entry in feed.entries:
+			published = extract_datetime(entry)
+
+			if not published:
+				continue
+
+			if published < CUTOFF_TIME:
+				continue
+
+			if entry.link in sent_articles:
+				continue
+
+			article_data = {
+						"title": html.escape(entry.title),
+						"link": entry.link,
+						"source": feed.feed.title,
+						"published": published
+					}
+
+			if url == CISA_FEED:
+				cisa_alerts.append(article_data)
+			else:
+				new_articles.append(article_data)
+
+	new_articles.sort(key=lambda x: x["published"], reverse=True)
+	cisa_alerts.sort(key=lambda x: x["published"], reverse=True)
+
+# -----------------------------
+# Build CISA Section
+# -----------------------------
+
+	if cisa_alerts:
+		cisa_items = "\n".join(
+			"""
+			<li>
+				<small>{a['published'].astimezone(LOCAL_TZ).strftime("%b %d, %Y at %I:%M %p %Z")}</small><br>
+				<a href="{a['link']}">{a['title']}</a>
+			</li>
+			"""
+			for a in cisa_alerts
+		)
+
+		cisa_section = f"""
+		<h3>CISA Alerts</h3>
+		<ul>
+		{cisa_items}
+		</ul>
+		"""
+	else:
+		cisa_section = """
+		<h3>CISA Alerts</h3>
+		<p>No CISA alerts at this time.</p>
+		"""
+
+# -----------------------------
+# Build Main Email
+# -----------------------------
+
+	if new_articles:
+		list_items = "\n".join(
+			"""
+			<li>
+				<b>{a['source']}</b><br>
+				<small>{a['published'].astimezone(LOCAL_TZ).strftime("%b %d, %Y at %I:%M %p %Z")}</small><br>
+				<a href="{a['link']}">{a['title']}</a>
+			</li>
+			"""
+			for a in new_articles
+		)
+
+		html_content = f"""
+		<html>
+		<head>
+		<style>
+		body {{ font-family: Arial, sans-serif; }}
+		li {{ margin-bottom: 12px; }}
+		small {{ color: gray; }}
+		</style>
+		</head>
+		<body>
+
+		{cisa_section}
+
+		<h3>Articles</h3>
+		<p>{len(new_articles)} new article(s) since last email.</p>
+		<ul>
+		{list_items}
+		</ul>
+
+		<div class="footer">
+			Generated by Braxton's Cyber-Digest • 
+			Last updated: {current_time_str} • 
+			<a href="https://github.com/braxhg/cyber-digest" style="color: #0066cc;">source code</a>
+		</div>
+
+		</body>
+		</html>
+		"""
+
+	else:
+
+		html_content = f"""
+		<html>
+		<body>
+		<p>No new articles since last email.</p>
+
+		<div class="footer">
+			Generated by Braxton's Cyber-Digest • 
+			Last updated: {current_time_str} • 
+			<a href="https://github.com/braxhg/cyber-digest" style="color: #0066cc;">source code</a>
+		</div>
+
+		</body>
+		</html>
+		"""
+
+# -----------------------------
+# Send Email
+# -----------------------------
+
+	msg = MIMEMultipart("alternative")
+	msg["Subject"] = "Braxton's Cyber Digest"
+	msg["From"] = os.environ.get("digest_email")
+	msg["To"] = ", ".join(EMAIL_TARGETS)
+
+	msg.attach(MIMEText(html_content, "html"))
+
+	with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+		server.login(
+			os.environ.get("digest_email"),
+			os.environ.get("digest_app_password")
+		)
+		server.sendmail(msg["From"], EMAIL_TARGETS, msg.as_string())
+
+# -----------------------------
+# Update State (only after send)
+# -----------------------------
+
+	for article in new_articles + cisa_alerts:
+		sent_articles.add(article["link"])
+
+	save_sent_articles(sent_articles)
+
+
+if __name__ == "__main__":
+	main()
