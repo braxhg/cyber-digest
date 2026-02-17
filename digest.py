@@ -151,7 +151,7 @@ def main():
 
 	if cisa_alerts:
 		cisa_items = "\n".join(
-			"""
+			f"""
 			<li>
 				<small>{a['published'].astimezone(LOCAL_TZ).strftime("%b %d, %Y at %I:%M %p %Z")}</small><br>
 				<a href="{a['link']}">{a['title']}</a>
@@ -178,7 +178,7 @@ def main():
 
 	if new_articles:
 		list_items = "\n".join(
-			"""
+			f"""
 			<li>
 				<b>{a['source']}</b><br>
 				<small>{a['published'].astimezone(LOCAL_TZ).strftime("%b %d, %Y at %I:%M %p %Z")}</small><br>
