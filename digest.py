@@ -15,16 +15,23 @@ from zoneinfo import ZoneInfo
 # Configuration
 # -----------------------------
 
-EMAIL_TARGETS = [
-
+INTERNAL_TARGETS = [
 	email.strip()
-	for email in os.environ.get("digest_targets","").split(",")
+	for email in os.environ.get("digest_internal_targets", "").split(",")
 	if email.strip()
-
 ]
 
-if not EMAIL_TARGETS:
-	EMAIL_TARGETS = ["fallback@email.com"]
+EXTERNAL_TARGETS = [
+	email.strip()
+	for email in os.environ.get("digest_external_targets", "").split(",")
+	if email.strip()
+]
+
+if not INTERNAL_TARGETS:
+	INTERNAL_TARGETS = ["internal@email.com"]
+
+if not EXTERNAL_TARGETS:
+	EXTERNAL_TARGETS = ["external@email.com"]
 
 CISA_FEED = "https://www.cisa.gov/cybersecurity-advisories/all.xml"
 
@@ -45,65 +52,62 @@ STATE_FILE = "sent_articles.json"
 CUTOFF_TIME = datetime.now(timezone.utc) - timedelta(hours=24)
 LOCAL_TZ = ZoneInfo("America/New_York")
 
-current_time_str = datetime.now(LOCAL_TZ).strftime("%b %d, %Y at %I:%M %p %Z")
 
 # -----------------------------
 # State Handling
 # -----------------------------
 
 def load_sent_articles():
-	if not os.path.exists(STATE_FILE):
-		return set()
-
-	if os.path.getsize(STATE_FILE) == 0:
+	if not os.path.exists(STATE_FILE) or os.path.getsize(STATE_FILE) == 0:
 		return set()
 
 	try:
 		with open(STATE_FILE, "r", encoding="utf-8") as f:
 			data = json.load(f)
-		if isinstance(data, list):
-			return set(data)
-		elif isinstance(data, dict):
-			return set(data.keys())   # in case someone saved as dict
-		else:
-			print(f"Warning: {STATE_FILE} has unexpected type {type(data)}. Starting fresh.")
-			return set()
-	except json.JSONDecodeError as e:
-		print(f"Warning: {STATE_FILE} is invalid JSON ({e}). Starting with empty set.")
-		return set()
-	except Exception as e:
-		print(f"Unexpected error reading {STATE_FILE}: {e}. Starting fresh.")
+		return set(data)
+	except Exception:
 		return set()
 
 
 def save_sent_articles(sent_set):
-	# Write to temp file → atomic replace (safer on crash)
-	data = list(sent_set)  # sets aren't directly JSON serializable
-	tmp = None
 	try:
 		with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
-			json.dump(data, tmp, indent=None, ensure_ascii=False)
+			json.dump(list(sent_set), tmp)
 			tmp_path = tmp.name
-
 		shutil.move(tmp_path, STATE_FILE)
 	except Exception as e:
-		print(f"Failed to save {STATE_FILE}: {e}")
-		if tmp_path and os.path.exists(tmp_path):
-			os.unlink(tmp_path)  # clean up temp file
+		print(f"Failed to save state: {e}")
 
 
 # -----------------------------
-# Helper Functions
+# Helpers
 # -----------------------------
 
 def extract_datetime(entry):
 	if entry.get("published_parsed"):
 		return datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
-
 	if entry.get("updated_parsed"):
 		return datetime(*entry.updated_parsed[:6], tzinfo=timezone.utc)
-
 	return None
+
+
+def send_email(subject, recipients, html_content):
+	if not recipients:
+		return
+
+	msg = MIMEMultipart("alternative")
+	msg["Subject"] = subject
+	msg["From"] = os.environ.get("digest_email")
+	msg["To"] = ", ".join(recipients)
+
+	msg.attach(MIMEText(html_content, "html"))
+
+	with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+		server.login(
+			os.environ.get("digest_email"),
+			os.environ.get("digest_app_password")
+		)
+		server.sendmail(msg["From"], recipients, msg.as_string())
 
 
 # -----------------------------
@@ -121,21 +125,18 @@ def main():
 		for entry in feed.entries:
 			published = extract_datetime(entry)
 
-			if not published:
-				continue
-
-			if published < CUTOFF_TIME:
+			if not published or published < CUTOFF_TIME:
 				continue
 
 			if entry.link in sent_articles:
 				continue
 
 			article_data = {
-						"title": html.escape(entry.title),
-						"link": entry.link,
-						"source": feed.feed.title,
-						"published": published
-					}
+				"title": html.escape(entry.title),
+				"link": entry.link,
+				"source": feed.feed.title,
+				"published": published
+			}
 
 			if url == CISA_FEED:
 				cisa_alerts.append(article_data)
@@ -145,115 +146,105 @@ def main():
 	new_articles.sort(key=lambda x: x["published"], reverse=True)
 	cisa_alerts.sort(key=lambda x: x["published"], reverse=True)
 
+	current_time_str = datetime.now(LOCAL_TZ).strftime("%b %d, %Y at %I:%M %p %Z")
+
 # -----------------------------
 # Build CISA Section
 # -----------------------------
 
 	if cisa_alerts:
 		cisa_items = "\n".join(
-			f"""
-			<li>
-				<small>{a['published'].astimezone(LOCAL_TZ).strftime("%b %d, %Y at %I:%M %p %Z")}</small><br>
-				<a href="{a['link']}">{a['title']}</a>
-			</li>
-			"""
+			f'''
+<li>
+	<small>{a['published'].astimezone(LOCAL_TZ).strftime('%b %d, %Y at %I:%M %p %Z')}</small><br>
+	<a href="{a['link']}">{a['title']}</a>
+</li>
+'''.strip()
 			for a in cisa_alerts
 		)
 
-		cisa_section = f"""
-		<h3>CISA Alerts</h3>
-		<ul>
-		{cisa_items}
-		</ul>
-		"""
+		cisa_section = f'''
+<h3>CISA Alerts</h3>
+<ul>
+{cisa_items}
+</ul>
+'''
 	else:
-		cisa_section = """
-		<h3>CISA Alerts</h3>
-		<p>No CISA alerts at this time.</p>
-		"""
+		cisa_section = '''
+<h3>CISA Alerts</h3>
+<p>No CISA alerts at this time.</p>
+'''
 
 # -----------------------------
-# Build Main Email
+# Build Shared Body
 # -----------------------------
 
 	if new_articles:
 		list_items = "\n".join(
-			f"""
-			<li>
-				<b>{a['source']}</b><br>
-				<small>{a['published'].astimezone(LOCAL_TZ).strftime("%b %d, %Y at %I:%M %p %Z")}</small><br>
-				<a href="{a['link']}">{a['title']}</a>
-			</li>
-			"""
+			f'''
+<li>
+	<b>{a['source']}</b><br>
+	<small>{a['published'].astimezone(LOCAL_TZ).strftime('%b %d, %Y at %I:%M %p %Z')}</small><br>
+	<a href="{a['link']}">{a['title']}</a>
+</li>
+'''.strip()
 			for a in new_articles
 		)
 
-		html_content = f"""
-		<html>
-		<head>
-		<style>
-		body {{ font-family: Arial, sans-serif; }}
-		li {{ margin-bottom: 12px; }}
-		small {{ color: gray; }}
-		</style>
-		</head>
-		<body>
-
-		{cisa_section}
-
-		<h3>Articles</h3>
-		<p>{len(new_articles)} new article(s) since last email.</p>
-		<ul>
-		{list_items}
-		</ul>
-
-		<div class="footer">
-			Generated by Braxton's Cyber-Digest • 
-			Last updated: {current_time_str} • 
-			<a href="https://github.com/braxhg/cyber-digest" style="color: #0066cc;">source code</a>
-		</div>
-
-		</body>
-		</html>
-		"""
-
+		body_section = f'''
+<h3>Articles</h3>
+<p>{len(new_articles)} new article(s) since last email.</p>
+<ul>
+{list_items}
+</ul>
+'''
 	else:
-
-		html_content = f"""
-		<html>
-		<body>
-		<p>No new articles since last email.</p>
-
-		<div class="footer">
-			Generated by Braxton's Cyber-Digest • 
-			Last updated: {current_time_str} • 
-			<a href="https://github.com/braxhg/cyber-digest" style="color: #0066cc;">source code</a>
-		</div>
-
-		</body>
-		</html>
-		"""
+		body_section = "<p>No new articles since last email.</p>"
 
 # -----------------------------
-# Send Email
+# Internal Email
 # -----------------------------
 
-	msg = MIMEMultipart("alternative")
-	msg["Subject"] = "Braxton's Cyber Digest"
-	msg["From"] = os.environ.get("digest_email")
-	msg["To"] = ", ".join(EMAIL_TARGETS)
-
-	msg.attach(MIMEText(html_content, "html"))
-
-	with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-		server.login(
-			os.environ.get("digest_email"),
-			os.environ.get("digest_app_password")
-		)
-		server.sendmail(msg["From"], EMAIL_TARGETS, msg.as_string())
+	internal_html = f'''
+<html>
+	<body>
+		<h2>Cyber-Digest</h2>
+		{cisa_section}
+		{body_section}
+			<div class="footer">
+            Generated by Braxton's Cyber-Digest •
+			Last updated: {current_time_str}
+			</div>
+	</body>
+</html>
+'''
 
 # -----------------------------
-# Update State (only after send)
+# External Email
+# -----------------------------
+
+	external_html = f'''
+<html>
+	<body>
+		<h2>Cyber-Digest</h2>
+		{cisa_section}
+		{body_section}
+			<div class="footer">
+			Last updated: {current_time_str}
+			</div>
+	</body>
+</html>
+'''
+
+# -----------------------------
+# Send Emails
+# -----------------------------
+
+	send_email("Internal Cyber Digest", INTERNAL_TARGETS, internal_html)
+	send_email("Cyber Digest", EXTERNAL_TARGETS, external_html)
+
+# -----------------------------
+# Update State
 # -----------------------------
 
 	for article in new_articles + cisa_alerts:
